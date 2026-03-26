@@ -24,9 +24,12 @@ Built with [MiroFish](https://github.com/666ghj/MiroFish) + [OASIS](https://gith
 ## Quick Start
 
 ```bash
-# Clone
-git clone https://github.com/YOUR_ORG/swarmy-skillz.git
-cd swarmy-skillz
+# Install via skills.sh (works with Claude Code, Cursor, Cline, Copilot, 20+ agents)
+npx skilladd AaroneGeorge/Swarmy-Skillz
+
+# Or manual install
+git clone https://github.com/AaroneGeorge/Swarmy-Skillz.git
+cd Swarmy-Skillz
 
 # One-command setup (gets API keys, starts Docker)
 chmod +x setup.sh && ./setup.sh
@@ -34,8 +37,7 @@ chmod +x setup.sh && ./setup.sh
 # Install skills into Claude Code
 cp -r skills/* ~/.claude/skills/
 
-# Use it
-# In Claude Code, type:
+# Use it — in Claude Code, type:
 /swarmy "Will the Fed cut rates in June?"
 ```
 
