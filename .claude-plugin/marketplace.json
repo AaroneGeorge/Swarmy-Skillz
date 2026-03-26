@@ -1,0 +1,54 @@
+{
+  "name": "swarmy-skillz",
+  "displayName": "Swarmy Skillz — AI Swarm Intelligence for Prediction Markets",
+  "description": "Thousands of AI agents debate any question on simulated social media, then compare crowd consensus against live Polymarket, Kalshi, and Manifold odds to find betting edges.",
+  "version": "2.0.0",
+  "author": {
+    "name": "AaroneGeorge",
+    "url": "https://github.com/AaroneGeorge"
+  },
+  "repository": "https://github.com/AaroneGeorge/Swarmy-Skillz",
+  "license": "MIT",
+  "keywords": [
+    "prediction-markets",
+    "swarm-intelligence",
+    "polymarket",
+    "kalshi",
+    "manifold",
+    "ai-agents",
+    "mirofish",
+    "crypto",
+    "solana"
+  ],
+  "skills": [
+    {
+      "name": "swarm-intelligence",
+      "path": "skills/swarm-intelligence/SKILL.md",
+      "command": "/swarmy",
+      "description": "Run AI swarm simulations to predict outcomes on any question"
+    },
+    {
+      "name": "market-polymarket",
+      "path": "skills/market-polymarket/SKILL.md",
+      "description": "Read Polymarket prediction market odds and calculate edge vs swarm consensus"
+    },
+    {
+      "name": "market-kalshi",
+      "path": "skills/market-kalshi/SKILL.md",
+      "description": "Read Kalshi (CFTC-regulated) prediction market odds and calculate edge vs swarm consensus"
+    },
+    {
+      "name": "market-manifold",
+      "path": "skills/market-manifold/SKILL.md",
+      "description": "Read Manifold Markets odds and calculate edge vs swarm consensus"
+    }
+  ],
+  "requirements": {
+    "docker": true,
+    "python": ">=3.11",
+    "env": [
+      "NVIDIA_API_KEY",
+      "ZEP_API_KEY"
+    ]
+  }
+}
