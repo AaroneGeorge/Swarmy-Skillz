@@ -1,0 +1,26 @@
+version: "3.8"
+
+services:
+  mirofish:
+    image: ghcr.io/666ghj/mirofish:latest
+    container_name: mirofish
+    ports:
+      - "5001:5001"   # MiroFish API
+      - "3000:3000"   # MiroFish frontend UI (optional)
+    environment:
+      - LLM_API_KEY=${LLM_API_KEY}
+      - LLM_BASE_URL=${LLM_BASE_URL:-https://integrate.api.nvidia.com/v1}
+      - LLM_MODEL_NAME=${LLM_MODEL_NAME:-meta/llama-3.3-70b-instruct}
+      - ZEP_API_KEY=${ZEP_API_KEY:-}
+    volumes:
+      - mirofish_data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  mirofish_data:
