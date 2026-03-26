@@ -25,7 +25,7 @@ Built with [MiroFish](https://github.com/666ghj/MiroFish) + [OASIS](https://gith
 
 ```bash
 # Install via skills.sh (works with Claude Code, Cursor, Cline, Copilot, 20+ agents)
-npx skilladd AaroneGeorge/Swarmy-Skillz
+npx skills add AaroneGeorge/Swarmy-Skillz
 
 # Or manual install
 git clone https://github.com/AaroneGeorge/Swarmy-Skillz.git
