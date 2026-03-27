@@ -136,9 +136,11 @@ Response: {"success": true, "data": {"task_id": "task_xxx", "graph_id": "mirofis
 
 GET /api/graph/task/{task_id}
 Response: {"success": true, "data": {"status": "completed", "graph_id": "mirofish_xxx"}}
+Note: graph_id may be null in the task status response. If so, retrieve it from the project list API below.
 
 GET /api/graph/project/list
-Response: {"success": true, "data": [...], "count": N}
+Response: {"success": true, "data": [{"project_id": "proj_xxx", "graph_id": "mirofish_xxx", ...}], "count": N}
+Use this as a fallback to retrieve graph_id when the task status doesn't include it.
 ```
 
 ### Simulation
@@ -175,10 +177,16 @@ Poll every 5 seconds until runner_status is "completed".
 POST /api/report/generate
 Body: {"simulation_id": "sim_xxx"}
 Response: {"success": true, "data": {"report_id": "report_xxx", "status": "generating"}}
+Note: Prone to 429 rate limits — the client retries automatically with exponential backoff.
+
+POST /api/report/generate/status
+Body: {"simulation_id": "sim_xxx"}   ← NOTE: uses simulation_id, NOT report_id
+Response: {"success": true, "data": {"status": "completed|generating|failed"}}
 
 POST /api/report/chat
 Body: {"simulation_id": "sim_xxx", "message": "What % of agents believe YES?"}
 Response: {"success": true, "data": {"response": "Based on the analysis..."}}
+Note: Response text may be in Chinese — this is normal for MiroFish.
 ```
 
 ## Step-by-Step Pipeline
@@ -217,16 +225,39 @@ result = client.run_full_simulation(
     seed_content=seed_markdown,
     verbose=True,
 )
+# Returns: {
+#   "project_id": str,
+#   "simulation_id": str,
+#   "status": dict,       # final run status
+#   "report": dict,       # generated report
+#   "prediction": dict,   # chat response with consensus
+#   "error": str | None,  # set if pipeline failed
+# }
 ```
 
-This internally calls: ontology/generate → graph/build → simulation/create → prepare → start → poll → report/generate → chat
+This internally calls: upload_text → graph/build → poll task → simulation/create → prepare → poll prep → start → poll run → generate_report → chat
+
+**Important notes:**
+- `run_full_simulation()` automatically retries on 429 rate limit errors (exponential backoff)
+- If `graph_id` is not returned by the task status API, it falls back to the project list API
+- The method returns an `"error"` key if any step fails — always check `result.get("error")` before accessing other keys
 
 ### Step 5 — Extract consensus
 ```python
 from swarmbet import _extract_consensus
-consensus = _extract_consensus(result["prediction"]["data"]["response"])
+
+# Handle both response formats the API may return
+prediction_raw = result.get("prediction", {})
+prediction_text = (
+    prediction_raw.get("response")
+    or (prediction_raw.get("data", {}) or {}).get("response")
+    or str(prediction_raw)
+)
+consensus = _extract_consensus(prediction_text)
 # Returns: {pct: 40, direction: "NO", confidence: "MEDIUM", insights: [...]}
 ```
+
+**Note:** MiroFish responses may contain Chinese text — this is normal. The `_extract_consensus()` parser handles both English and Chinese keywords for direction, confidence, and insight extraction.
 
 ### Step 6 — Display results
 
@@ -313,17 +344,24 @@ Warn users upfront: "The swarm needs 5-10 minutes to debate. Grab a coffee."
 
 - **MiroFish unreachable**: Check `MIROFISH_URL`. Make sure Docker is running and the container is up: `docker compose up -d`.
 - **Graph build fails with ZEP error**: `ZEP_API_KEY` is required (not optional). Sign up free at https://app.getzep.com.
+- **graph_id is None**: The task status API sometimes doesn't return `graph_id`. The client automatically falls back to the project list API (`GET /api/graph/project/list`) to retrieve it.
 - **LLM call hangs**: Some models can be unresponsive. The default `meta/llama-3.3-70b-instruct` is recommended.
-- **Simulation stuck**: If `runner_status` hasn't changed in 2 minutes, check MiroFish logs. NVIDIA API rate limits are the most common cause.
-- **Poor seed data**: If consensus is 50/50 with LOW confidence, the seed data was insufficient. User can provide additional context with `--context`.
+- **429 Too Many Requests**: Report generation and chat endpoints are rate-limited. The client retries automatically with exponential backoff (5s, 10s, 20s). If it still fails, wait a minute and retry.
+- **Simulation stuck / prepare stays at not_started**: Usually caused by a null `graph_id` cascading into simulation creation. The fix above should prevent this. If it still happens, check MiroFish logs: `docker compose logs mirofish`.
+- **Poor seed data**: If consensus is 50/50 with LOW confidence, the seed data was insufficient. The collector now generates enriched context for general questions even without a news API key. User can also provide additional context with `--context`.
+- **Chinese text in responses**: MiroFish is a Chinese-language backend. Chat responses and logs may contain Chinese text. The consensus extractor handles both English and Chinese.
 - **CoinGecko rate limit**: Wait 60 seconds or set `COINGECKO_API_KEY` for higher limits.
+- **Polymarket/Kalshi unreachable**: These APIs may be blocked by DNS in certain regions (e.g., India). The client logs a warning and returns empty results — Manifold will still work. Consider using a VPN if you need all three markets.
+- **News API 401**: If `NEWS_API_KEY` returns 401, the key may be invalid or expired. Get a new one at https://newsapi.org. Without it, the collector generates synthetic context from the question itself.
 
 ## Limitations (Be Honest With Users)
 
 1. Swarm consensus predicts **crowd behavior**, not outcomes.
-2. Quality depends entirely on seed data — garbage in, garbage out.
+2. Quality depends entirely on seed data — garbage in, garbage out. Without a News API key, general questions get synthetic context only.
 3. Simulations take 5-10 minutes — not suitable for time-sensitive decisions.
-4. NVIDIA free tier has rate limits — heavy use may need a higher-tier key (free tier is generous).
+4. NVIDIA free tier has rate limits — heavy use may need a higher-tier key (free tier is generous). Report generation is particularly prone to 429 errors.
 5. Zep free tier has 1000 credits/month — each simulation uses ~1-3 credits.
-6. MiroFish is relatively new software — expect occasional instability.
-7. Results are in English but the underlying MiroFish logs are in Chinese (this is normal).
+6. MiroFish is relatively new software — expect occasional instability (null graph_ids, stuck preparations).
+7. Results and MiroFish logs/chat responses may contain Chinese text — this is normal. The parser handles it.
+8. Polymarket and Kalshi APIs may be unreachable from certain regions (e.g., India) due to DNS/geo-blocking. Only Manifold is globally accessible.
+9. Market search uses client-side filtering — niche topics may return zero results even when markets exist.

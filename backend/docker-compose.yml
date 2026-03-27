@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   mirofish:
     image: ghcr.io/666ghj/mirofish:latest

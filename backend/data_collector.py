@@ -247,12 +247,48 @@ class DataCollector:
         if search_terms:
             for term in search_terms:
                 try:
-                    news.extend(self.get_news(term, page_size=5))
+                    results = self.get_news(term, page_size=5)
+                    # Filter out fallback/placeholder entries
+                    real_news = [r for r in results if r.get("source") != "system"]
+                    news.extend(real_news)
                 except Exception as e:
                     print(f"Warning: Failed news search for '{term}': {e}")
+
+        # If no real news was collected, generate enriched context from the question itself
+        # so MiroFish has enough material to build a meaningful ontology
+        enriched_context = custom_context or ""
+        if not news:
+            question_context = self._generate_question_context(question, search_terms)
+            enriched_context = f"{question_context}\n\n{enriched_context}".strip() if enriched_context else question_context
 
         return self.format_as_markdown(
             question=question,
             news=news if news else None,
-            custom_context=custom_context,
+            custom_context=enriched_context if enriched_context else None,
+        )
+
+    @staticmethod
+    def _generate_question_context(question: str, search_terms: list[str] | None = None) -> str:
+        """Generate enriched context from the question when no external data is available.
+
+        This ensures MiroFish has enough seed material (>200 chars) to build a meaningful
+        ontology even without news API data.
+        """
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        terms = ", ".join(search_terms[:5]) if search_terms else question
+
+        return (
+            f"## Analysis Context\n\n"
+            f"**Prediction question:** {question}\n"
+            f"**Date of analysis:** {now}\n"
+            f"**Key topics:** {terms}\n\n"
+            f"This question requires the swarm to consider multiple perspectives:\n"
+            f"- Historical precedent: What has happened in similar situations before?\n"
+            f"- Current trajectory: What is the current trend or status quo?\n"
+            f"- Key stakeholders: Who are the main actors and what are their incentives?\n"
+            f"- Catalysts: What events could tip the outcome in either direction?\n"
+            f"- Risks: What are the main downside scenarios?\n"
+            f"- Timeline: Is the deadline realistic given the current pace of change?\n\n"
+            f"The swarm should debate whether the answer is YES or NO, "
+            f"considering both bull and bear cases with specific reasoning."
         )

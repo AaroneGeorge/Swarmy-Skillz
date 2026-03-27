@@ -146,7 +146,13 @@ def run_prediction(question: str, custom_context: str | None = None, verbose: bo
     if verbose:
         print(f"[4/5] Extracting prediction from swarm output...")
 
-    prediction_text = result["prediction"].get("response", "")
+    # Handle both response formats: {"response": "..."} and {"data": {"response": "..."}}
+    prediction_raw = result.get("prediction", {})
+    prediction_text = (
+        prediction_raw.get("response")
+        or (prediction_raw.get("data", {}) or {}).get("response")
+        or str(prediction_raw)
+    )
     consensus = _extract_consensus(prediction_text)
 
     # Step 5: Build structured output
@@ -176,39 +182,86 @@ def run_prediction(question: str, custom_context: str | None = None, verbose: bo
 def _extract_consensus(text: str) -> dict:
     """Extract structured consensus data from MiroFish chat response.
 
-    Best-effort parsing — MiroFish responses vary in format.
+    Best-effort parsing — MiroFish responses vary in format and may contain
+    Chinese text (the underlying engine is Chinese-language). This parser
+    handles English, Chinese, and mixed-language responses.
     """
     pct = 50  # default
     direction = "UNCERTAIN"
     confidence = "MEDIUM"
     insights = []
 
-    # Try to find percentage
-    pct_match = re.search(r'(\d{1,3})(?:\.\d+)?%', text)
-    if pct_match:
-        pct = int(pct_match.group(1))
-        pct = max(0, min(100, pct))
+    # Try to find percentage — multiple patterns
+    pct_patterns = [
+        r'(\d{1,3})(?:\.\d+)?\s*%',                    # "68%" or "68.5 %"
+        r'(\d{1,3})(?:\.\d+)?\s*percent',               # "68 percent"
+        r'YES.*?(\d{1,3})(?:\.\d+)?%',                  # "YES at 68%"
+        r'consensus.*?(\d{1,3})(?:\.\d+)?%',             # "consensus is 68%"
+        r'(\d{1,3})(?:\.\d+)?%.*?(?:YES|agree|support)', # "68% YES"
+        r'(\d{1,3})(?:\.\d+)?%.*?(?:认为|支持|赞成)',      # Chinese: "68% believe/support"
+    ]
+    for pattern in pct_patterns:
+        pct_match = re.search(pattern, text, re.IGNORECASE)
+        if pct_match:
+            pct = int(pct_match.group(1))
+            pct = max(0, min(100, pct))
+            break
 
     # Direction from percentage
     if pct >= 55:
         direction = "YES"
-    elif pct <= 50:
+    elif pct <= 45:
         direction = "NO"
+    else:
+        # 46-54% range: check text for explicit direction cues
+        text_lower = text.lower()
+        yes_cues = ["lean yes", "favor yes", "likely yes", "positive", "bullish",
+                     "支持", "赞成", "看好", "倾向于是"]
+        no_cues = ["lean no", "favor no", "likely no", "negative", "bearish",
+                    "反对", "不支持", "看空", "倾向于否"]
+        if any(cue in text_lower for cue in yes_cues):
+            direction = "YES"
+        elif any(cue in text_lower for cue in no_cues):
+            direction = "NO"
 
-    # Confidence detection
+    # Confidence detection — English and Chinese keywords
     text_lower = text.lower()
-    if any(w in text_lower for w in ["high confidence", "strong consensus", "overwhelming"]):
+    high_conf = [
+        "high confidence", "strong consensus", "overwhelming", "clear majority",
+        "decisively", "firmly", "strongly agree", "near unanimous",
+        "高置信", "强烈共识", "压倒性", "明确多数",
+    ]
+    low_conf = [
+        "low confidence", "divided", "split", "uncertain", "unclear",
+        "contested", "no consensus", "closely split", "evenly divided",
+        "低置信", "分歧", "不确定", "分裂", "无共识",
+    ]
+    if any(w in text_lower for w in high_conf):
         confidence = "HIGH"
-    elif any(w in text_lower for w in ["low confidence", "divided", "split", "uncertain", "unclear"]):
+    elif any(w in text_lower for w in low_conf):
         confidence = "LOW"
 
-    # Extract insight sentences (heuristic: sentences with key terms)
-    sentences = re.split(r'[.!?\n]', text)
-    insight_keywords = ["because", "due to", "driven by", "shifted", "turned", "majority", "key factor", "notably"]
+    # Extract insight sentences — broadened keyword set, handles Chinese
+    sentences = re.split(r'[.!?\n。！？]', text)
+    insight_keywords = [
+        "because", "due to", "driven by", "shifted", "turned", "majority",
+        "key factor", "notably", "primarily", "significant", "important",
+        "influenced", "suggests", "indicates", "trend", "momentum",
+        "risk", "catalyst", "argue", "believe", "reason",
+        # Chinese keywords
+        "因为", "由于", "驱动", "转变", "多数", "关键因素", "主要",
+        "重要", "影响", "表明", "趋势", "风险", "催化", "认为", "原因",
+    ]
     for s in sentences:
         s = s.strip()
-        if len(s) > 20 and any(k in s.lower() for k in insight_keywords):
+        if len(s) > 15 and any(k in s.lower() for k in insight_keywords):
             insights.append(s)
+
+    # If no insights found from keywords, take the longest non-trivial sentences
+    if not insights:
+        candidates = [s.strip() for s in sentences if len(s.strip()) > 30]
+        insights = sorted(candidates, key=len, reverse=True)[:3]
+
     insights = insights[:5]  # cap at 5
 
     return {

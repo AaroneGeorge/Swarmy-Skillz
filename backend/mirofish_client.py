@@ -6,8 +6,11 @@ Python wrapper for all MiroFish endpoints. Configurable via MIROFISH_URL env var
 
 import os
 import time
+import logging
 import requests
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 class MiroFishClient:
@@ -24,6 +27,24 @@ class MiroFishClient:
         resp = self.session.post(self._url(path), **kwargs)
         resp.raise_for_status()
         return resp.json()
+
+    def _post_with_retry(self, path: str, max_retries: int = 3, **kwargs) -> dict:
+        """POST with exponential backoff retry on 429 and 5xx errors."""
+        for attempt in range(max_retries + 1):
+            try:
+                return self._post(path, **kwargs)
+            except requests.exceptions.HTTPError as e:
+                status_code = e.response.status_code if e.response is not None else 0
+                if status_code == 429 or status_code >= 500:
+                    if attempt < max_retries:
+                        wait = 2 ** attempt * 5  # 5s, 10s, 20s
+                        logger.warning(
+                            "HTTP %d on %s — retrying in %ds (attempt %d/%d)",
+                            status_code, path, wait, attempt + 1, max_retries,
+                        )
+                        time.sleep(wait)
+                        continue
+                raise
 
     def _get(self, path: str, **kwargs) -> dict:
         resp = self.session.get(self._url(path), **kwargs)
@@ -87,7 +108,7 @@ class MiroFishClient:
             fname, fbytes, ftype = file_content
             files["files"] = (fname, fbytes, ftype)
 
-        return self._post("/api/graph/ontology/generate", data=data, files=files if files else None)
+        return self._post_with_retry("/api/graph/ontology/generate", data=data, files=files if files else None)
 
     def upload_text(self, simulation_requirement: str, content: str,
                     filename: str = "seed_data.md",
@@ -108,7 +129,7 @@ class MiroFishClient:
 
         Returns: {"success": True, "data": {"task_id": "...", "graph_id": "..."}}
         """
-        return self._post("/api/graph/build", json={"project_id": project_id})
+        return self._post_with_retry("/api/graph/build", json={"project_id": project_id})
 
     def get_task_status(self, task_id: str) -> dict:
         """Check a graph build task status."""
@@ -134,7 +155,7 @@ class MiroFishClient:
 
     def start_simulation(self, simulation_id: str) -> dict:
         """Start running the swarm simulation."""
-        return self._post("/api/simulation/start", json={"simulation_id": simulation_id})
+        return self._post_with_retry("/api/simulation/start", json={"simulation_id": simulation_id})
 
     def get_run_status(self, simulation_id: str) -> dict:
         """Check simulation run status."""
@@ -172,12 +193,19 @@ class MiroFishClient:
     # --- Reports & Chat ---
 
     def generate_report(self, simulation_id: str) -> dict:
-        """Generate a prediction report from completed simulation."""
-        return self._post("/api/report/generate", json={"simulation_id": simulation_id})
+        """Generate a prediction report from completed simulation.
 
-    def get_report_status(self, report_id: str) -> dict:
-        """Check report generation status."""
-        return self._post("/api/report/generate/status", json={"report_id": report_id})
+        Uses retry logic — report generation is prone to 429 rate limits.
+        """
+        return self._post_with_retry("/api/report/generate", json={"simulation_id": simulation_id})
+
+    def get_report_status(self, simulation_id: str) -> dict:
+        """Check report generation status.
+
+        Args:
+            simulation_id: The simulation whose report status to check.
+        """
+        return self._post("/api/report/generate/status", json={"simulation_id": simulation_id})
 
     def get_report(self, report_id: str) -> dict:
         """Get a generated report."""
@@ -257,6 +285,22 @@ class MiroFishClient:
                 if task_data.get("status") in ("failed", "error"):
                     return {"project_id": project_id, "error": f"Graph build failed: {task_data}"}
                 time.sleep(3)
+
+        # Fallback: if graph_id is still None, retrieve it from the project list API
+        if not graph_id:
+            log("  → graph_id not in task status, querying project list...")
+            try:
+                projects = self.list_projects(limit=50)
+                for proj in projects.get("data", []):
+                    if proj.get("project_id") == project_id:
+                        graph_id = proj.get("graph_id")
+                        break
+            except Exception as e:
+                log(f"  → Warning: failed to query project list: {e}")
+
+        if not graph_id:
+            return {"project_id": project_id, "error": "Graph build completed but graph_id could not be retrieved"}
+
         log(f"  → Graph built: {graph_id}")
 
         # Step 3: Create & prepare simulation
@@ -269,6 +313,7 @@ class MiroFishClient:
 
         # Poll preparation status (allow time for async prep to start)
         time.sleep(5)
+        prep_ready = False
         start = time.time()
         while time.time() - start < 300:
             prep = self.get_prepare_status(simulation_id)
@@ -276,10 +321,20 @@ class MiroFishClient:
             prep_status = prep_data.get("status", "unknown")
             log(f"    prepare status: {prep_status}")
             if prep_status in ("ready", "completed", "prepared"):
+                prep_ready = True
                 break
             if prep_status in ("failed", "error"):
                 return {"project_id": project_id, "simulation_id": simulation_id, "error": f"Preparation failed: {prep_data}"}
             time.sleep(3)
+
+        if not prep_ready:
+            return {
+                "project_id": project_id,
+                "simulation_id": simulation_id,
+                "error": f"Preparation timed out after 300s (last status: {prep_status}). "
+                         "This usually means the NVIDIA API is rate-limited (429). "
+                         "Wait a few minutes and try again.",
+            }
 
         # Step 4: Start simulation
         log("  → Starting swarm simulation...")
@@ -299,11 +354,14 @@ class MiroFishClient:
                 "error": "Simulation failed",
             }
 
-        # Step 5: Generate report and extract prediction
+        # Step 5: Generate report and extract prediction (with retry for rate limits)
         log("  → Generating report...")
-        report = self.generate_report(simulation_id)
+        report = self.generate_report(simulation_id)  # already uses _post_with_retry
         log("  → Extracting prediction via chat...")
-        prediction = self.chat(simulation_id, extraction_prompt)
+        prediction = self._post_with_retry("/api/report/chat", json={
+            "simulation_id": simulation_id,
+            "message": extraction_prompt,
+        })
 
         return {
             "project_id": project_id,

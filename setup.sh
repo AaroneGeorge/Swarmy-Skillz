@@ -45,7 +45,7 @@ echo "✓ Python 3 found"
 # Install Python deps
 echo ""
 echo "Installing Python dependencies..."
-pip install requests --quiet 2>/dev/null || pip3 install requests --quiet 2>/dev/null
+pip install requests python-dotenv --quiet 2>/dev/null || pip3 install requests python-dotenv --quiet 2>/dev/null || python3 -m pip install requests python-dotenv --quiet 2>/dev/null
 echo "✓ Python dependencies installed"
 
 # Setup .env
@@ -75,9 +75,9 @@ echo "1. NVIDIA API Key (for LLM inference)"
 echo "   Get yours free: https://build.nvidia.com"
 read -p "   Paste your NVIDIA_API_KEY: " nvidia_key
 if [ -n "$nvidia_key" ]; then
-    sed -i "s|^NVIDIA_API_KEY=.*|NVIDIA_API_KEY=$nvidia_key|" backend/.env
-    sed -i "s|^LLM_API_KEY=.*|LLM_API_KEY=$nvidia_key|" backend/.env
-    echo "   ✓ NVIDIA key saved"
+    sed -i "s|^NVIDIA_API_KEY=.*|NVIDIA_API_KEY=${nvidia_key}|" backend/.env
+    sed -i "s|^LLM_API_KEY=.*|LLM_API_KEY=${nvidia_key}|" backend/.env
+    echo "   ✓ NVIDIA key saved (set for both NVIDIA_API_KEY and LLM_API_KEY)"
 fi
 
 echo ""

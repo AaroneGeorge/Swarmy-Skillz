@@ -5,8 +5,11 @@ Supports: Polymarket, Kalshi, Manifold Markets
 No API keys required for read access.
 """
 
+import logging
 import requests
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 class MarketReader:
@@ -24,37 +27,44 @@ class MarketReader:
 
         No API key required. Uses the Gamma API.
         Fallback to CLOB API if Gamma is unavailable.
+
+        Fetches a large batch and filters client-side since the Gamma API
+        doesn't support text search — only sorting by volume.
         """
+        # Fetch enough markets for meaningful client-side filtering
+        fetch_limit = max(100, limit * 20)
+
         # Try Gamma API first
         for base in ["https://gamma-api.polymarket.com", "https://clob.polymarket.com"]:
             try:
                 if "gamma" in base:
                     resp = self.session.get(
                         f"{base}/markets",
-                        params={"closed": "false", "limit": limit, "order": "volume", "ascending": "false"},
+                        params={"closed": "false", "limit": fetch_limit, "order": "volume", "ascending": "false"},
                         timeout=self.timeout,
                     )
                     if resp.ok:
                         markets = resp.json()
-                        # Filter by query
                         if query:
-                            q = query.lower()
-                            markets = [m for m in markets if q in m.get("question", "").lower()]
+                            markets = self._fuzzy_filter(markets, query, key="question")
                         return [self._normalize_polymarket(m) for m in markets[:limit]]
                 else:
                     resp = self.session.get(
                         f"{base}/markets",
-                        params={"next_cursor": "MA==", "limit": 100},
+                        params={"next_cursor": "MA==", "limit": fetch_limit},
                         timeout=self.timeout,
                     )
                     if resp.ok:
                         data = resp.json()
                         markets = data.get("data", data) if isinstance(data, dict) else data
                         if query:
-                            q = query.lower()
-                            markets = [m for m in markets if q in m.get("question", "").lower()]
+                            markets = self._fuzzy_filter(markets, query, key="question")
                         return [self._normalize_polymarket_clob(m) for m in markets[:limit]]
-            except (requests.RequestException, ValueError):
+            except requests.exceptions.ConnectionError as e:
+                logger.warning("Polymarket (%s) unreachable — DNS or network issue: %s", base, e)
+                continue
+            except (requests.RequestException, ValueError) as e:
+                logger.warning("Polymarket (%s) request failed: %s", base, e)
                 continue
         return []
 
@@ -103,21 +113,48 @@ class MarketReader:
     def kalshi_search(self, query: str, limit: int = 5) -> list[dict]:
         """Search Kalshi for active markets.
 
-        No API key required for read access.
+        No API key required for read access. Uses the /events endpoint
+        (with nested markets) since the /markets endpoint returns MVE
+        multi-leg markets with concatenated titles that are unsearchable.
+        Paginates through events and filters by query words.
         """
         try:
-            resp = self.session.get(
-                "https://api.elections.kalshi.com/trade-api/v2/markets",
-                params={"limit": 100, "status": "open"},
-                timeout=self.timeout,
-            )
-            resp.raise_for_status()
-            markets = resp.json().get("markets", [])
+            all_markets = []
+            cursor = None
+            # Paginate through events (up to 100 events = ~10 pages)
+            for _ in range(10):
+                params = {"limit": 10, "status": "open", "with_nested_markets": "true"}
+                if cursor:
+                    params["cursor"] = cursor
+                resp = self.session.get(
+                    "https://api.elections.kalshi.com/trade-api/v2/events",
+                    params=params,
+                    timeout=self.timeout,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                events = data.get("events", [])
+                cursor = data.get("cursor")
+
+                for event in events:
+                    event_title = event.get("title", "")
+                    for mkt in event.get("markets", []):
+                        # Use event title as the readable question (market titles are often truncated)
+                        mkt["_event_title"] = event_title
+                        all_markets.append(mkt)
+
+                if not cursor or not events:
+                    break
+
             if query:
-                q = query.lower()
-                markets = [m for m in markets if q in m.get("title", "").lower()]
-            return [self._normalize_kalshi(m) for m in markets[:limit]]
-        except (requests.RequestException, ValueError):
+                all_markets = self._fuzzy_filter(all_markets, query, key="_event_title")
+
+            return [self._normalize_kalshi(m) for m in all_markets[:limit]]
+        except requests.exceptions.ConnectionError as e:
+            logger.warning("Kalshi unreachable — DNS or network issue: %s", e)
+            return []
+        except (requests.RequestException, ValueError) as e:
+            logger.warning("Kalshi request failed: %s", e)
             return []
 
     def _normalize_kalshi(self, m: dict) -> dict:
@@ -138,9 +175,12 @@ class MarketReader:
         yes_price = to_float(yes_bid)
         no_price = to_float(no_bid)
 
+        # Use event title if available (more readable than market title)
+        question = m.get("_event_title") or m.get("title", "")
+
         return {
             "source": "kalshi",
-            "question": m.get("title", ""),
+            "question": question,
             "ticker": m.get("ticker", ""),
             "url": f"https://kalshi.com/markets/{m.get('ticker', '')}",
             "yes_price": yes_price,
@@ -156,7 +196,7 @@ class MarketReader:
     def manifold_search(self, query: str, limit: int = 5) -> list[dict]:
         """Search Manifold Markets for active markets.
 
-        No API key required.
+        No API key required. Manifold has a proper text search endpoint.
         """
         try:
             resp = self.session.get(
@@ -166,22 +206,62 @@ class MarketReader:
             )
             resp.raise_for_status()
             markets = resp.json()
-            return [self._normalize_manifold(m) for m in markets[:limit]]
-        except (requests.RequestException, ValueError):
+            normalized = [self._normalize_manifold(m) for m in markets[:limit]]
+            # Filter out markets where we couldn't determine a price
+            return [m for m in normalized if m["yes_price"] is not None]
+        except requests.exceptions.ConnectionError as e:
+            logger.warning("Manifold unreachable — DNS or network issue: %s", e)
+            return []
+        except (requests.RequestException, ValueError) as e:
+            logger.warning("Manifold request failed: %s", e)
             return []
 
     def _normalize_manifold(self, m: dict) -> dict:
+        # probability is the primary field, but some markets use other fields
         prob = m.get("probability")
+        if prob is None:
+            # Fallback: try to derive from pool YES/NO shares
+            pool = m.get("pool", {})
+            yes_pool = pool.get("YES", 0)
+            no_pool = pool.get("NO", 0)
+            if yes_pool + no_pool > 0:
+                prob = no_pool / (yes_pool + no_pool)  # AMM-style pricing
+
         return {
             "source": "manifold",
             "question": m.get("question", ""),
             "url": m.get("url", ""),
             "yes_price": round(prob, 4) if prob is not None else None,
             "no_price": round(1 - prob, 4) if prob is not None else None,
+            "probability": round(prob, 4) if prob is not None else None,
             "volume": m.get("volume"),
             "liquidity": m.get("totalLiquidity"),
             "active": not m.get("isResolved", False),
         }
+
+    # ─── Fuzzy Filtering ─────────────────────────────────────────
+
+    @staticmethod
+    def _fuzzy_filter(markets: list[dict], query: str, key: str = "question") -> list[dict]:
+        """Filter markets by matching ANY word from the query (case-insensitive).
+
+        This is more permissive than exact substring matching — a query like
+        "Iran ceasefire" will match markets containing either "Iran" OR "ceasefire".
+        Results containing more query words are ranked first.
+        """
+        query_words = [w.lower() for w in query.split() if len(w) > 2]
+        if not query_words:
+            return markets
+
+        scored = []
+        for m in markets:
+            text = m.get(key, "").lower()
+            matches = sum(1 for w in query_words if w in text)
+            if matches > 0:
+                scored.append((matches, m))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [m for _, m in scored]
 
     # ─── Unified Search ──────────────────────────────────────────
 
@@ -189,13 +269,25 @@ class MarketReader:
         """Search all supported prediction markets.
 
         Returns normalized results from all sources.
+        Logs warnings when individual markets are unreachable.
         """
         results = []
-        for search_fn in [self.polymarket_search, self.kalshi_search, self.manifold_search]:
+        sources_searched = []
+        for name, search_fn in [("Polymarket", self.polymarket_search), ("Kalshi", self.kalshi_search), ("Manifold", self.manifold_search)]:
             try:
-                results.extend(search_fn(query, limit=limit))
-            except Exception:
+                found = search_fn(query, limit=limit)
+                results.extend(found)
+                if found:
+                    sources_searched.append(name)
+                else:
+                    logger.info("%s returned no matching markets for query: %s", name, query)
+            except Exception as e:
+                logger.warning("%s search failed: %s", name, e)
                 continue
+
+        if not sources_searched:
+            logger.warning("No prediction markets returned results for query: %s", query)
+
         # Sort by volume (descending), with None last
         results.sort(key=lambda x: float(x.get("volume") or 0), reverse=True)
         return results[:limit * 3]
